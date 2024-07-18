@@ -1,0 +1,1334 @@
+---
+title: "Proyecto Matemática Actuarial III"
+author: "Isaac Sandoval"
+date: "2023-12-07"
+output: html_document
+header-includes:
+- \usepackage{amsmath}
+- \usepackage{mathtools}
+- \usepackage{graphicx}
+- \usepackage{multirow}
+- \usepackage{multicol}
+- \usepackage[spanish]{babel}
+- \usepackage{bm}
+- \newcommand{\probP}{\text{I\kern-0.15em P}}
+---
+
+```{r cars}
+
+library(tidyverse)
+library(knitr)
+library(readxl)
+library(dplyr)
+library(lubridate)
+#library(matrixcalc) 
+library(RColorBrewer)
+library(ggdark)
+library(purrr)
+library(openxlsx)
+#library(expm)
+#library(abind)
+library(ggplot2)
+library(forecast)
+library(Rlab)
+library(fExtremes)
+```
+
+En este documento se presentan los procedimientos y resultados de la modelación actuarial, valoración y estimación del seguro de vida universal plus del INS. Lo anterior se realizó mediante la implementación de un arbol binario para estimación de las tasas cortas, así como el uso de la teoría de valoración para determinar los distintos flujos asociados al seguro per se y el desarrollo de un modelo estocástico para determinar las diferentes pérdidas asociadas al seguro dados los diversos escenarios plausibles.
+
+Para ello, es necesario sentar las bases teóricas de los métodos a implementar y homogenizar las bases de datos que se van a utilizar
+
+Primeramente, se cargan los datos referentes a las probabilidades de invalidez y muerte de hombres y mujeres, así como los casos que se van a modelar posteriormente.
+
+```{r}
+
+invalidez_hombres <- read_excel("C:\\Users\\Usuario\\Desktop\\Actuariado\\Mate Actuarial III\\Proyecto\\Datos.xlsx", 
+                                sheet = 3,  range="A3:B104") %>%
+                                rename(Probabilidad =2) 
+
+invalidez_mujeres <- read_excel("C:\\Users\\Usuario\\Desktop\\Actuariado\\Mate Actuarial III\\Proyecto\\Datos.xlsx", 
+                                sheet = 4,  range="A3:B104") %>%
+                                rename(Probabilidad =2) 
+
+muerte_hombres <- read_excel("C:\\Users\\Usuario\\Desktop\\Actuariado\\Mate Actuarial III\\Proyecto\\Datos.xlsx", 
+                                sheet = 1,  range="A3:B119") %>%
+                                rename(Probabilidad_muerte =2) %>%
+                                subset(edad>0)
+
+muerte_mujeres <- read_excel("C:\\Users\\Usuario\\Desktop\\Actuariado\\Mate Actuarial III\\Proyecto\\Datos.xlsx", 
+                                sheet = 2,  range="A3:B119") %>%
+                                rename(Probabilidad_muerte =2) %>% 
+                                subset(edad>0)
+
+población_asegurada <- read_excel("C:\\Users\\Usuario\\Desktop\\Actuariado\\Mate Actuarial III\\Proyecto\\Datos.xlsx", 
+                                sheet = 5,  range="A1:G28") %>%
+                                rename(Edad_asegurado =2, Genero_asegurado=3, Periodicidad = 4) %>%
+                                mutate(Edad_Conyugue = as.numeric(Edad_Conyugue), 
+                                       Genero_Conyugue = as.numeric(Genero_Conyugue))
+
+```
+
+Las probabilidades iniciales se encuentran en términos anuales. Sin embargo, dado que la unidad de tiempo a lo largo de este estudio es mensual, resulta pertinente hacer alguna asunción para la obtención de las probabilidades mensuales. Una de las posibilidades es el uso del supuesto de Fuerza Uniforme, en el cual ${}_t p_{x}^{(i)} = tp_{x}^{(i)}$, donde $0 \leq t \leq 1$.
+
+```{r}
+
+# Función para calcular las 12-ésimas probabilidades mediante Fuerza Uniforme.
+
+probabilidades_mensuales <- function(valor){
+
+  final <- as.numeric(valor)*seq((1/12):(11/12), by=(1/12))
+  final
+}
+
+```
+
+Para el caso de las probabilidades de invalidez, se tiene que existen edades (especificamente aquellas previas a los 17 años) cuyos valores no se poseen. Para solventar esta cuestión, se realizó un backcasting utilizando los valores ya proporcionados. Primeramente se aplicó para el caso de los hombres y posteriormente para el caso de las mujeres.
+
+```{r}
+
+# Backcasting para las probabilidades de invalidez de los hombres
+
+x <- ts(invalidez_hombres[4:101,2])
+h <- 18
+f <- frequency(x)
+# Reverse time
+revx <- ts(rev(x), frequency=f)
+# Forecast
+fc <- forecast(auto.arima(revx), h)
+plot(fc)
+# Reverse time again
+fc$mean <- ts(rev(fc$mean),end=tsp(x)[1] - 1/f, frequency=f)
+fc$upper <- fc$upper[h:1,]
+fc$lower <- fc$lower[h:1,]
+fc$x <- x
+# Plot result
+plot(fc, xlim=c(tsp(x)[1]-h/f, tsp(x)[2]))
+
+invalidez_hombres <- rbind(as.data.frame(cbind(seq(1,17), as.numeric(fc$mean[17:1]))) %>% rename(Edad = 1, Probabilidad = 2), invalidez_hombres[4:101,])
+
+```
+
+```{r}
+
+# Backcasting para las probabilidades de invalidez de las mujeres.
+
+x <- ts(invalidez_mujeres[4:101,2])
+h <- 10
+f <- frequency(x)
+# Reverse time
+revx <- ts(rev(x), frequency=f)
+# Forecast
+fc <- forecast(auto.arima(revx), h)
+plot(fc)
+# Reverse time again
+fc$mean <- ts(rev(fc$mean),end=tsp(x)[1] - 1/f, frequency=f)
+fc$upper <- fc$upper[h:1,]
+fc$lower <- fc$lower[h:1,]
+fc$x <- x
+# Plot result
+plot(fc, xlim=c(tsp(x)[1]-h/f, tsp(x)[2]))
+
+invalidez_mujeres <- rbind(as.data.frame(cbind(seq(1,17), c(unlist(rep(0, 14)), as.numeric(fc$mean[8:10])))) %>% rename(Edad = 1, Probabilidad = 2), invalidez_mujeres[4:101,])
+
+```
+
+Por otro lado, es pertinente obtener las probabilidades para riesgos en competencias, dado que el algunos casos va a ser necesaria hacer uso de las mismas. Para ello se hace uso del supuesto de fuerza de mortalidad constante, aplicando las siguientes relaciones:
+
+${}_t p_{x}^{(\tau)} = \prod_{i=1}^m {}_t p_{x}^{'(i)}$
+
+$q_{[x]}^{(j)} = \dfrac{log(p_{[x]}^{'(j)})}{log(p_{[x]}^{(\tau)})}* q_{[x]}^{(\tau)}$
+
+Y dado que se poseen los valores de los decrementos individuales, es fácil obtener los valores deseados.
+
+```{r}
+
+probabilidades_en_competencia_hombres <- cbind(seq(1,115), (muerte_hombres[,2]* invalidez_hombres[,2]), 
+      (log(1-muerte_hombres[,2])/log(muerte_hombres[,2]* invalidez_hombres[,2]))*(1-muerte_hombres[,2]* invalidez_hombres[,2]),
+      (log(1-invalidez_hombres[,2])/log(muerte_hombres[,2]* invalidez_hombres[,2]))*(1-muerte_hombres[,2]* invalidez_hombres[,2])) %>% 
+  rename(Edad = 1, Probabilidades_tau = 2, Muerte_en_competencia = 3, Invalidez_en_competencia = 4)
+
+probabilidades_en_competencia_mujeres <- cbind(seq(1,115), (muerte_mujeres[,2]* invalidez_mujeres[,2]), 
+      (log(1-muerte_mujeres[,2])/log(muerte_mujeres[,2]* invalidez_mujeres[,2]))*(1-muerte_mujeres[,2]* invalidez_mujeres[,2]),
+      (log(1-invalidez_mujeres[,2])/log(muerte_mujeres[,2]* invalidez_mujeres[,2]))*(1-muerte_mujeres[,2]* invalidez_mujeres[,2])) %>% 
+  rename(Edad = 1, Probabilidades_tau = 2, Muerte_en_competencia = 3, Invalidez_en_competencia = 4)
+
+```
+
+Seguidamente, se calculan las probabilidades mensuales utilizando los supuestos de Fuerza de mortalidad constante y de Fuerza Uniforme respectivamente.
+
+```{r}
+
+probabilidades_m_esimas <- function(valor){
+  
+  final <- (valor)^(seq((1/12):(11/12), by=(1/12)))
+  final
+  
+}
+
+probabilidades_en_competencia <- as.data.frame(cbind(rep(1:115, each=12), 
+                                      rep(1:12, 115), 
+                                      unlist(as.matrix(probabilidades_en_competencia_hombres[,3]) %>%
+                                               map(probabilidades_m_esimas)),
+                                      unlist(as.matrix(probabilidades_en_competencia_mujeres[,3]) %>%
+                                               map(probabilidades_m_esimas)),
+                                      unlist(as.matrix(probabilidades_en_competencia_hombres[,4]) %>%
+                                               map(probabilidades_m_esimas)), 
+                                      unlist(as.matrix(probabilidades_en_competencia_mujeres[,4]) %>%
+                                               map(probabilidades_m_esimas)))) %>% 
+  rename(Edad = 1, Mes = 2, Muerte_hombres_en_competencia = 3, Muerte_mujeres_en_competencia = 4,
+         Invalidez_hombres_en_competencia=5, Invalidez_mujeres_en_competencia = 6)
+
+
+probabilidades <- as.data.frame(cbind(rep(1:115, each=12), 
+                                      rep(1:12, 115), 
+                                      unlist(as.matrix(muerte_hombres[,2]) %>% map(probabilidades_m_esimas)),
+                                      unlist(as.matrix(muerte_mujeres[,2]) %>% map(probabilidades_m_esimas)),
+                                      unlist(as.matrix(invalidez_hombres[,2]) %>%
+                                               map(probabilidades_m_esimas)), 
+                                      unlist(as.matrix(invalidez_mujeres[,2]) %>%
+                                               map(probabilidades_m_esimas)))) %>% 
+  rename(Edad = 1, Mes = 2, Probabilidad_muerte_hombres = 3, Probabilidad_muerte_mujeres = 4, Invalidez_hombres=5, Invalidez_mujeres = 6)
+
+```
+
+# Curvas cero cupón mediante los modelos Nelson-Siegel y Svénsson
+
+Don Nelson y Charles Siegel partieron de la asunción de que la tasa forward instantánea es la solución de una ecuación diferencial de segundo orden con dos raíces iguales para plantear un modelo paramétrico en el cual la estructura temporal de las tasas de interés se podía descomponer mediante tres factores: el nivel, la pendiente y la curvatura. En este modelo, el parámetro $\beta_0$ representa el límite de la curva de rendimientos, mientras que $\beta_1$ es el componente de corto plazo y $\beta_2$ el de mediano plazo.
+
+La formulación de dicho modelo viene dada por la siguiente ecuación:
+
+$$
+    \delta(T) = \beta_{0} + \beta_{1} \left(\frac{1-e^{-T/\eta_{1}}}{T/\eta_{1}}\right) + \beta_{2} \left(\frac{1-e^{-T/\eta_{1}}}{T/\eta_{1}} - e^{-T/\eta_{1}}\right)
+$$ 
+
+Por otro lado, el modelo de Svénsson constituye una extensión de la propuesta hecha por Nelson y Sigel, extensión que le otorga una mayor flexibilidad y una mejor calibraciónal adicionar una segunda joroba. Este modelo esta planteado de la siguiente manera:
+
+$$
+\delta(T) = \beta_{0} + \beta_{1} \left(\frac{1-e^{-T/\eta_{1}}}{T/\eta_{1}} \right) + \beta_{2}     \left(\frac{1-e^{-T/\eta_{1}}}{T/\eta_{1}} - e^{-T/\eta_{1}} \right) + \beta_{3} \left(\frac{1-e^{-T/\eta_{2}}}{T/\eta_{2}} - e^{-T/\eta_{2}} \right)
+$$
+Con lo cual, utilizando los parámetros (para el caso de la Nelson-Siegel):
+
+-   $\beta_0 = 0,09$
+-   $\beta_1 = -0,02$
+-   $\beta_2 = 0,05$
+-   $\eta_1 = 96$
+
+y los parámetros (para el caso de la Svensson):
+
+-   $\beta_0 = 0,07$
+-   $\beta_1 = -0,01$
+-   $\beta_2 = -0,03$
+-   $\beta_3 = 0,05$
+-   $\eta_1 = 48$
+-   $\eta_2 = 64$
+
+se pueden crear las funciones para obtener las tasas compuestas continuamentes asociadas a un plazo determinado para las curvas cero cupón en colones y en UDES.
+
+```{r}
+
+Nelson_Siegel <- function(t, beta_0=0.09, beta_1=-0.02, beta_2=0.05, eta_1=96){
+  
+  tasa <- beta_0 + beta_1*((1 - exp(-t/eta_1))/(t/eta_1)) + beta_2*(((1-exp(-t/eta_1))/(t/eta_1)) - exp(-t/eta_1))
+  tasa
+}
+
+Svensson <- function(t, beta_0=0.07, beta_1=-0.01, beta_2=-0.03, beta_3=0.05, eta_1=48, eta_2=64){
+  
+  tasa <- beta_0 + beta_1*((1 - exp(-t/eta_1))/(t/eta_1)) + 
+    beta_2*(((1-exp(-t/eta_1))/(t/eta_1)) - exp(-t/eta_1)) + 
+    beta_3*( ((1-exp(-t/eta_2))/(t/eta_2)) - exp(-t/eta_2))
+  tasa
+  
+}
+
+curva_Nelson_Siegel <- as.data.frame(unlist(seq(1:180) %>% map(Nelson_Siegel))) %>%
+  mutate(Tiempos = seq(1:180)) %>%
+  rename(Tasas = 1)
+
+curva_Svensson <- as.data.frame(unlist(seq(1:180) %>% map(Nelson_Siegel))) %>%
+  mutate(Tiempos = seq(1:180)) %>%
+  rename(Tasas = 1)
+
+```
+
+Al aplicar ambas funciones para obtener las respectivas curvas, se obtienen los siguientes gráficos.
+
+```{r}
+
+ggplot(curva_Nelson_Siegel,aes(x=Tiempos,y=Tasas))+
+  geom_line(aes(color='darkred')) + 
+  geom_line(data = curva_Svensson, aes(x=Tiempos,y=Tasas, color='darkblue')) +
+  labs(y='Precio', x = 'Mes', title = 'Curva Cero Cupón para colones') +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 90),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black")) 
+
+ggplot(curva_Svensson,aes(x=Tiempos,y=Tasas))+
+  geom_line(aes(color='darkred')) + 
+  geom_line(data = curva_Svensson, aes(x=Tiempos,y=Tasas, color='darkblue')) +
+  labs(y='Precio', x = 'Mes', title = 'Curva Cero Cupón para colones') +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 90),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black")) 
+
+```
+
+Así mismo, utilizando la curva dada por $e^{-\delta t}$, donde $\delta$ son las tasas dadas por el modelo de Svensson o Nelson-Siegel; se puede obtener la Curva Bono Cero Cupón o también conocida como la estructura temporal de factores de descuento, la cual es una curva decreciente respecto al tiempo debido a la positividad de las tasas de interés.
+
+```{r}
+
+precio_cero_cupon_colones <- function(t){
+  
+  cero_cupon <- exp(-t*Nelson_Siegel(t))
+  cero_cupon
+  
+}
+
+precio_cero_cupon_udes <- function(t){
+  
+  cero_cupon <- exp(-t*Svensson(t))
+  cero_cupon
+  
+}
+
+curva_bono_cero_cupon_colones <- as.data.frame(unlist(seq(1:180) %>% map(precio_cero_cupon_colones))) %>% 
+  rename(Cero_Cupon = 1) %>% mutate(Mes  = seq(1:180))
+#as.data.frame(unlist(seq(1:180) %>% map(precio_cero_cupon_udes))) %>% rename(Cero_Cupon = 1)
+
+curva_bono_cero_cupon_udes <- as.data.frame(unlist(seq(1:180) %>% map(precio_cero_cupon_udes))) %>% 
+  rename(Cero_Cupon = 1) %>% mutate(Mes  = seq(1:180))
+#as.data.frame(unlist(seq(1:180) %>% map(precio_cero_cupon_udes))) %>% rename(Cero_Cupon = 1)
+
+# Gráfico para la curva bono cero cupón en colones
+
+ggplot(as.data.frame(unlist(seq(1:179) %>% map(precio_cero_cupon_colones))) %>% 
+         rename(Cero_Cupon = 1),aes(x=seq(1:179),y=Cero_Cupon, group = 1))+
+  geom_line(aes(color='darkred')) + 
+  labs(y='Precio', x = 'Mes', title = 'Curva Bono Cero Cupón para colones') +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 90),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black")) 
+
+# Gráfico para la curva bono cero cupón en udes
+
+ggplot(as.data.frame(unlist(seq(1:179) %>% map(precio_cero_cupon_udes))) %>% 
+         rename(Cero_Cupon = 1),aes(x=seq(1:179),y=Cero_Cupon, group = 1))+
+  geom_line(aes(color='darkred')) + 
+  labs(y='Precio', x = 'Mes', title = 'Curva Bono Cero Cupón para colones') +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 90),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black")) 
+
+```
+
+Una vez que se poseen las funciones para obtener los precios de los cero cupón, se puede obtener la tasa forward compuesta continuamente de la siguiente manera:
+
+-   $F(0;t,t+1) = \dfrac{P(o,t) - P(0,t+1)}{\tau(t,t+1)P(0,t+1)}$
+-   $F_E(0;t,t+1) = \tau(t,t+1) F(0;t,t+1)$: Note que como la unidad temporal es un mes, entonces $\tau(t,t+1) = 1$, lo que implica que $F_E(0;t,t+1) = \dfrac{P(o,t) - P(0,t+1)}{P(0,t+1)}$.
+-   $\rho_F(0;t,t+1) = (1+F_e(0;t,t+1))^{\dfrac{1}{\tau(t,t+1)}} - 1$
+-   $\delta_F(0;t,t+1) = ln(1+\rho_F(0;t,t+1))$
+
+Las tasas forward compuestas continuamente jugaran un papel importante más adelante en la construcción del árbol binario de tasas cortas estocásticas.
+
+```{r}
+
+# Tasa forward efectiva para los tiempos S y V, vistas hoy en t=0.
+
+tasa_forward_efectiva <- function(t, precio){
+  
+  tasa <- (precio(t)-precio(t+1))/(precio(t+1))
+  tasa
+  
+}
+
+tasa_forward_compuesta_continuamente <- function(t, precio){
+  
+  tasa <- log(1+tasa_forward_efectiva(t,precio))
+  tasa
+  
+}
+
+# tasas forward compuestas continuamente para los 179 momentos en colones
+#unlist(seq(1:179) %>% map(tasa_forward_compuesta_continuamente, precio=precio_cero_cupon_colones))
+
+# tasas forward compuestas continuamente para los 179 momentos en UDES
+#unlist(seq(1:179) %>% map(tasa_forward_compuesta_continuamente, precio=precio_cero_cupon_udes))
+
+```
+
+# Implementación del modelo de Ho-Lee
+
+Para la aplicación del modelo de árboles binomiales asuma las siguientes hipótesis:
+
+-   Las transacciónes se dan en tiempos determinados (en este caso, de manera mensual). Esto conlleva que las tasas cortas $r_t$ no sean instantáneas, sino que sean tasas compuestas continuamente a lo largo del periodo dado. De la misma manera, el factor de descuento $D(t,t+1) = e^{-r_t}$ es $F_t-$medible, o lo que es lo mismo, $D(t,t+1) = P(t,t+1)$.
+
+-   Asuma que no existen condiciones de fricción en el mercado. Es decir, se pueden comprar las cantidades que se deseen, es permitido vender en corto y no existen costos de transacción.
+
+Este modelo presenta grandes ventajas, entre ellas el hecho de ser Marked-to-Market, por lo que los precios teóricos que se obtienen coinciden con los que se pueden observar de la Curva Cero Cupón estimada con anterioridad.
+
+Thomas Ho y Sang Bin Lee desarrollaron un modelo ampliamente utilizado en las matemáticas financieras, en particular para la modelización de tasas de interés futuras realizada a través de la implementación de un árbol binario. Para su aplicación es necesario poseer tres elementos:
+
+*   Determinar las funciones de perturbación u(T) y d(T).
+*   Derivar la medida martingala de riesgo neutral.
+*   Derivar las condiciones necesarias para asegurar independencia en los movimientos a través del árbol binario.
+
+Esta última fue demostrada en clase. Ahora, dado los parámetros u(2) y d(2) tanto para colones como para udes, es posible determinar la medida martingala y las funciones de perturbación para cada uno de los momentos. Dichos parámetros son:
+
+-   u(2) = 1,0001 y d(2) = 0,9999; para el caso de colones.
+
+-   u(2) = 1,00005 y d(2) = 0,99995; para el caso de UDES.
+
+```{r}
+
+k_colones <- 0.9999/1.0001
+
+k_udes <- 0.99995/1.00005
+
+q_tilde <- ((1-0.99999)/(1.00001 -0.99999))
+
+d_temporal <- function(t, k){
+  
+  valor <- k^(t-1)/((1-q_tilde) *k^(t-1) + q_tilde)
+  valor
+  
+}
+
+d_colones <- unlist(seq(1:180) %>% map(\(x) d_temporal(x, k=k_colones)))[2:180]
+
+d_udes <- unlist(seq(1:180) %>% map(\(x) d_temporal(x, k=k_udes)))[2:180]
+
+```
+
+Habiendo obtenido los 3 elementos esenciales para la implementación del modelo, se empiezan por crear los nodos superiores del árbol binario. Este es, aquellos nodos cuya perturbación es siempre hacia arriba en todo momento. Por otro lado, es conocido que dado un nodo en un momento t arbitrario, los nodos inferiores se puede obtener restando ln(k) la cantidad de veces requeridas. Esto es, si se está en el moemnto t = 3 y se posee el nodo superior, entonces el nodo inferior inmediato se obtiene restando ln(k); y el nodo inferior consecuente se obtiene restando nuevamente ln(k), donde k es el parámetro obtenido previamente.
+
+```{r}
+
+# Se crean los nodos superiores para los 180 momentos
+
+nodos_superior <- function(tiempo){
+  
+  tasa <- tasa_forward_compuesta_continuamente(tiempo-1, precio_cero_cupon_colones) - 
+    log(d_colones[tiempo-1]) + (tiempo-1)*log(k_colones)
+  tasa
+}
+
+nodos_superiores <- c(log(1 + (1-precio_cero_cupon_colones(1))/(precio_cero_cupon_colones(1))), unlist(seq(1:180) %>% map(nodos_superior)))
+
+# Se crean el resto de nodos inferiores para cada uno de los momentos, teniendo así el árbol completo
+
+nodo_inferior <- function(nodo){
+  
+  valor <- nodo - log(k_colones)
+  
+}
+
+nodos_completos <- map2(nodos_superiores, seq_along(nodos_superiores), ~ accumulate(rep(.x, .y), ~ nodo_inferior(.x)))
+nodos_completos <- sapply(nodos_completos, '[', seq(max(sapply(nodos_completos,length))))
+
+```
+
+Se aplica lo anterior con los valores para la curva en UDES
+
+```{r}
+
+nodos_superior_udes <- function(tiempo){
+  
+  tasa <- tasa_forward_compuesta_continuamente(tiempo-1, precio_cero_cupon_udes) - 
+    log(d_udes[tiempo-1]) + (tiempo-1)*log(k_udes)
+  tasa
+}
+
+nodos_superiores_udes <- c(log(1 + (1-precio_cero_cupon_udes(1))/(precio_cero_cupon_udes(1))), unlist(seq(1:180) %>% map(nodos_superior_udes)))
+
+# Se crean el resto de nodos inferiores para cada uno de los momentos, teniendo así el árbol completo
+
+nodo_inferior_udes <- function(nodo){
+  
+  valor <- nodo - log(k_udes)
+  
+}
+
+nodos_completos_udes <- map2(nodos_superiores_udes, seq_along(nodos_superiores_udes), ~ accumulate(rep(.x, .y), ~ nodo_inferior_udes(.x)))
+nodos_completos_udes <- sapply(nodos_completos_udes, '[', seq(max(sapply(nodos_completos_udes,length))))
+
+```
+
+Una vez que se posee el árbol binario, es preciso implementar las secuencias de movimiento estocásticas a través del mismo.
+
+Primeramente, se genera un vector Bernoulli de 179 entradas (el punto de inicio ya se conoce) con probabilidad q_tilde. Luego, se hace uso de función suma acumulada, de manera que el movimiento sea el siguiente. Cada vez que la suma acumulada aumente en uno, el algortimo se mueve una fila hacia abajo, y en cada iteración se produce un movimiento hacia la columna de la derecha. POr ejemplo, si el vector de suma acumulada fuera (1,1,1,2,3,3,4), entonces se tendría el siguiente movimiento: \* (1,1) \* (1,2) \* (1,3) \* (2,4) \* (3,5) \* (3,6) \* (4,7) y así sucesivamente. Dado que el vector Bernoulli es aleatorio, esto brinda el elemento estocástico al algoritmo.
+
+```{r}
+
+# Secuencia de movimientos: 1 sube, 0 baja
+secuencia <- rbern(179, prob = ((1-0.99999)/(1.00001 -0.99999)))
+
+# Secuencia alterada: si era 0 se pone 1 y viceversa
+
+secuencia_transformada <- c(1, secuencia %>% map(function(x) ifelse(x == 1, 0, 1)))
+
+# Se toman los nodos 
+
+nodos_completos[cbind(cumsum(secuencia_transformada), seq_along(cumsum(secuencia_transformada)))]
+
+# Generalización del proceso anterior
+
+tasas_estocasticas <- function(nodos){
+  
+  secuencia <- rbern(179, prob = ((1-0.99999)/(1.00001 -0.99999)))
+  
+  secuencia_transformada <- c(1, secuencia %>% map(function(x) ifelse(x == 1, 0, 1)))
+  
+  tasas <- nodos[cbind(cumsum(secuencia_transformada), seq_along(cumsum(secuencia_transformada)))]
+  tasas
+}
+
+```
+
+POsteriormente, se procede a implementar 100 000 veces el modelo,
+
+```{r}
+
+# Se aplica el modelo 100 000 veces
+
+tasas_cortas <- replicate(100000, tasas_estocasticas(nodos_completos))
+
+#Se sacan la suma de las tasas cortas previas
+
+acumuladas <- tasas_cortas %>% apply(2, cumsum) %>% apply(2, function(x) exp(-x))
+
+promedios_para_cada_momento <- as.data.frame(apply(acumuladas, 1, mean)) %>% 
+  mutate(Tiempo = seq(1:180)) %>%
+  rename(Tasas_promediadas = 1)
+
+# Se aplica lo mismo para el caso de UDES
+
+tasas_cortas_udes <- replicate(100000, tasas_estocasticas(nodos_completos_udes))
+
+#Se sacan la suma de las tasas cortas previas
+
+acumuladas_udes <- tasas_cortas_udes %>% apply(2, cumsum) %>% apply(2, function(x) exp(-x))
+
+promedios_para_cada_momento_udes <- as.data.frame(apply(acumuladas_udes, 1, mean)) %>% 
+  mutate(Tiempo = seq(1:180)) %>%
+  rename(Tasas_promediadas = 1)
+
+```
+
+Comparativa entre las tasas cortas estocásticas promediadas y la curva bono cero cupón con la Nelson-Siegel para colones y la curva bono cero cupón dada por la Svensson para UDES.
+
+```{r}
+
+ggplot(data = curva_bono_cero_cupon_colones) + 
+  geom_line(aes(x=Mes, y=Cero_Cupon, color='Cero Cupón'), linetype = 1) + 
+  geom_line(data = promedios_para_cada_momento, aes(x=Tiempo, y=Tasas_promediadas, 
+                                                    color='Tasas Promediadas'), linetype = 2) +
+  labs(y = 'Precios', x = 'Tiempo', 
+       title = 'Tasas cortas promediadas versus curva Bono Cero Cupón/Colones') +
+  theme(legend.position = "bottom",  
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black"),
+         axis.text = element_text(colour = "black"),
+        legend.text = element_text(size = 14),  
+        legend.title = element_text(size = 14)) +
+  scale_color_manual(values = c('darkblue', 'darkred'), 
+                     labels = c('Cero Cupón', 'Tasas Promediadas'), 
+                     name = "Curvas")
+
+ggplot(data = curva_bono_cero_cupon_udes) + 
+  geom_line(aes(x=Mes, y=Cero_Cupon, color='Cero Cupón'), linetype = 1) + 
+  geom_line(data = promedios_para_cada_momento_udes, aes(x=Tiempo, y=Tasas_promediadas, 
+                                                    color='Tasas Promediadas'), linetype = 2) +
+  labs(y = 'Precios', x = 'Tiempo', 
+       title = 'Tasas cortas promediadas versus curva Bono Cero Cupón/UDES') +
+  theme(legend.position = "bottom",  
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black"),
+         axis.text = element_text(colour = "black"),
+        legend.text = element_text(size = 14),  
+        legend.title = element_text(size = 14)) +
+  scale_color_manual(values = c('darkblue', 'darkred'), 
+                     labels = c('Cero Cupón', 'Tasas Promediadas'), 
+                     name = "Curvas")
+
+
+```
+
+Se puede observar en ambos gráficos que la aproximación de las distintas curvas mediante la aplicación del modelo de Ho-Lee es precisa y corrobora la teoría desarrollada.
+
+# Realización del modelado estocástico
+
+El seguro de vida universal plus del INS presenta diversas alternativas que se ajustan a las necesidades de los clientes que deseen adquirirlo, tales como distintos montos de aseguranza, periodicidades de pagos que se ajusten a la mayor conveniencia del asegurado, entre otros elementos que hacen de este seguro uno de los más flexibles. Así mismo, para poder realizar su análisis y modelación, es preciso conocer ciertos planteamientos como los flujos estocásticos, valores esperados, variables de pérdidas y demás.
+
+## Flujos estocásticos y sus respectivos valores esperados
+
+El primer flujo a analizar es el seguro de invalidez. Este viene dado por:
+
+$$
+\mathbb{E}^{\widetilde{Q}}[H_0^{(i)}] = 
+\mathbb{E}^{\widetilde{Q}}\biggl[\sum_{t=0}^{179} b \ \kappa^{(i)} \ 1_{\{t < \ T_x^{(i)} < \ t+1 < \ T_x^{(m)}\}} \ D(0,(t+1) + R) \biggr]\\ = b \ \sum_{t=0}^{179} \mathbb{E}^{\mathbb{P}}[\; \mathbb{E}^{Q} \, [\ \kappa^{(i)} \ 1_{\{t < \ T_x^{(i)} < \ t+1 < \ T_x^{(m)}\}} \ D(0,(t+1) + R)\,]\,]
+$$ 
+
+Ahora, note que como los omegas de $T_x^{(i)}$ viven en $\Omega_T$, entonces tanto la indicadora como $\kappa^{(i)}$ se toman como constantes. Así, salen de la primera esperanza, es decir:
+
+
+$$
+    = b \ \sum_{t=0}^{179} \mathbb{E}^{\mathbb{P}}[\; \mathbb{E}^{Q} \, [\ D(0,(t+1) + R)\,] \ \kappa^{(i)} \ 1_{\{t < \ T_x^{(i)} < \ t+1 < \ T_x^{(m)}\}} \,]\\ = b \ \sum_{t=0}^{179} \mathbb{E}^{\mathbb{P}}[\; P(0, (t+1)+R) \ \kappa^{(i)} \ 1_{\{t < \ T_x^{(i)} < \ t+1 < \ T_x^{(m)}\}} \,]
+$$
+
+Lo último sale directamente del Teorema Fundamental de la Valoración, pues el mejor predicto del factor de descuento con la información que tenemos hoy para el momento (t+1)+R \ (ie, $\mathbb{E}^{Q} \, [\ D(0,(t+1) + R)\, |\ F_0 \;]$) es precisamente un bono cupón con vencimiento en (t+1)+R \ ( P(0, (t+1)+R) ). con lo cual, tilizando el hecho de que este cero cupón es una constante conocida en el momento t=0, así como la independencia de $\kappa^{(i)}$ y $T_x^{(i)}$; se tiene que:
+
+$$
+= b \ \sum_{t=0}^{179} P(0, (t+1)+R) \ \mathbb{E}^{\mathbb{P}}[\; \kappa^{(i)} \ 1_{\{t < \ T_x^{(i)} < \ t+1 < \ T_x^{(m)}\}} \,]\\ = b \ \sum_{t=0}^{179} P(0, (t+1)+R) \ \mathbb{E}^{\mathbb{P}}[\; \kappa^{(i)} \ ] \ \mathbb{E}^{\mathbb{P}}[\; 1_{\{t < \ T_x^{(i)} < \ t+1 < \ T_x^{(m)}\}} \,]\\ = b \ \sum_{t=0}^{179} P(0, (t+1)+R) \ (\dfrac{1}{6} * 0,25 + \dfrac{1}{3} * 0,25 + \dfrac{1}{2} * 0,2 + 1 * 0,1 + 2 * 0,07 + 3 * 0,03) \ \\ * \ \mathbb{P}(\;t < \ T_x^{(i)} < \ t+1 < \ T_x^{(m)} \,)\\ = b \sum_{t=0}^{179} P(0, (t+1)+R) \ 0,655 \ * \ \mathbb{P}(\;t < \ T_x^{(i)} < \ t+1 < \ T_x^{(m)} \,) \\ = b \sum_{t=0}^{179} P(0, (t+1)+R) \ 0,655 \ * \ {}_t p_{[x]}^{(i)} q_{[x],t}^{(i)} * \biggl(1 - \sum_{k=0}^t {}_k p_{[x]}^{(m)} q_{[x],k}^{(m)} \biggr)
+$$
+
+
+### Seguro de muerte
+
+Este flujo viene dado por:
+
+$$
+\mathbb{E}^{\widetilde{Q}}[H_0^{(m)}] = b \ \sum_{t=0}^{179} P(0, (t+1)+R) \ \mathbb{E}^{\mathbb{P}}[\; \kappa^{(m)} \ 1_{\{t < \ T_x^{(m)} < \ t+1 \}} \,]\\ = b \ \sum_{t=0}^{179} P(0, (t+1)+R) \ \mathbb{E}^{\mathbb{P}}[\; \kappa^{(m)} \ ] \ \mathbb{E}^{\mathbb{P}} [\ 1_{\{t < \ T_x^{(m)} < \ t+1 \}} \,]\\ = b \ \sum_{t=0}^{179} P(0, (t+1)+R) \ (0,85 * 1 + 0,1 * 2 + 0,05 * 3) \ \mathbb{P} (\ t < \ T_x^{(m)} < \ t+1 \,)\\ = b \ \sum_{t=0}^{179} P(0, (t+1)+R) \ * \ 1,2 \ * \ \mathbb{P} (\ t < \ T_x^{(m)} < \ t+1 \,) \\ = b \ \sum_{t=0}^{179} P(0, (t+1)+R) \ * \ 1,2 \ * \ {}_t p_{[x]}^{'(m)} q_{[x],t}^{'(m)}
+$$
+
+### Seguro del cónyuge
+
+En este caso se tendría lo siguiente:
+
+$$
+\mathbb{E}^{\widetilde{Q}}[H_1^{(m)}] = \mathbb{E}^{\widetilde{Q}}\biggl[\sum_{t=0}^{179} b\ * \ 1_{\{ t < T_y^{(m)} \leq t +1 < T_x^{(m)} \}} \ D(0,(t+1) + R) \biggr]\\ = b \sum_{t=0}^{179} P(0, (t+1) + R) \ \mathbb{P}( t < T_y^{(m)} \leq t +1 < T_x^{(m)}) \\ = b \sum_{t=0}^{179} P(0, (t+1) + R) \ {}_t p_{[y]}^{(m)} q_{[y],t}^{(m)} * \biggl(1 - \sum_{k=0}^t {}_k p_{[x]}^{(m)} q_{[x],k}^{(m)} \biggr)
+$$
+
+### Gastos
+
+Para los gastos, inicialemnte se tiene que:
+
+$$
+\mathbb{E}^{\widetilde{Q}}[G] = \mathbb{E}^{\widetilde{Q}}\biggl[\sum_{t=0}^{179} M \ (1 + \pi(0,t)) \ 1_{\{ \ t < T_x^{(m)} \ \}} \ D(0,t) \biggr]\\ = M \ \sum_{t=0}^{179} \mathbb{E}^{\mathbb{P}}[\; \mathbb{E}^{Q} \, [\ (1 + \pi(o,t)) \ D(0,t)\,] \ 1_{\{ \ t < T_x^{(m)} \ \}} \,]
+$$
+Ahora, para la esperanza de adentro se tiene la siguiente relación:
+
+$$
+\mathbb{E}^{Q} \, [\ (1 + \pi(0,t)) \ D(0,t) \ ] = \mathbb{E}^{t} \, \biggl[\ (1 + \pi(0,t)) \ D(0,t) \dfrac{P(0,t)}{D(0,t)} \ \biggr]\\ = \mathbb{E}^{t} \, [\ (1 + \pi(0,t)) \ P(0,t) \ ] = \mathbb{E}^{t} \, [\ P^{(e)}(0,t) \ ] = P^{(e)}(0,t)
+$$
+
+Observe que la primera igualdad se da al aplicar un cambio de la medida Q de riesgo neutral a la medida t-forward, tomando la derivada de Radon-Nikodym como $\dfrac{P(0,t)}{D(0,t)}$. Así mismo, en la última igualdad el $P^{(e)}(0,t)$ sale de la esperanza pues es F$_0$-medible. Con lo cual:
+
+$$
+=  M \ \sum_{t=0}^{179} \ P^{(e)}(0,t) \ \mathbb{E}^{\mathbb{P}}[\; 1_{\{ \ t < T_x^{(m)} \ \}} \,]\\ = M \ \sum_{t=0}^{179} \ P^{(e)}(0,t) \ \mathbb{P} (\; t < T_x^{(m)} \,) \\ = M \ \sum_{t=0}^{179} \ P^{(e)}(0,t) \ \biggl(1 - \sum_{k=0}^{t-1} {}_k p_{[x]}^{'(m)} q_{[x],k}^{'(m)} \biggr)
+$$
+
+### Anualidad del asegurado
+
+Esta es la anualidad que se paga por la cobertura del asegurado, recordando que se paga siempre que el asegurado no haya muerto o caído en invalidez. Su flujo estocástico viene dado por:
+
+$$
+\mathbb{E}^{\widetilde{Q}}[H_o^{P}] = \\  = \mathbb{E}^{\widetilde{Q}} \biggl[\ P_0 + \sum_{n=1}^{14} \sum_{u \in J_0} \ \dfrac{P_0}{N_0} \ (1 + \pi(0,n+u)) \ (1 + j_n) \ 1_{\{ \ n < T_x^{(m)} \}} \ 1_{\{ \ n < T_x^{(i)} \}} \ D(0,n+u) \ \biggr]\\ = P_0 \ \sum_{n=1}^{14} \sum_{u \in J_0} \ \dfrac{P_0}{N_0} \ (1 + j_n) \ \mathbb{E}^{\mathbb{P}}[\; \mathbb{E}^{Q} \, [\ (1 + \pi(o,n+u)) \ D(0,n+u)\,] \ 1_{\{ \ n < T_x^{(m)} \}} \ 1_{\{ \ n < T_x^{(i)} \}} \,]\\ = P_0 \ \sum_{n_!}^{14} \sum_{u \in J_0} \ \dfrac{P_0}{N_0} \ (1 + j_n) \ P^{(e)}(0,n+u) \ \mathbb{E}^{\mathbb{P}}[\; \ 1_{\{ \ n < T_x^{(m)} \}} \ 1_{\{ \ n < T_x^{(i)} \}} \,]
+$$
+
+Como $T_x^{(m)}$ es independiente de $T_x^{(i)}$, entonces:
+
+$$
+= P_0 \ \sum_{n=1}^{14} \sum_{u \in J_0} \ \dfrac{P_0}{N_0} \ (1 + j_n) \ P^{(e)}(0,n+u) \ \mathbb{P}(\; n < T_x^{(m)} ) \ \mathbb{P}( n < T_x^{(i)} \,) \\ = P_0 \ \sum_{n=1}^{14} \sum_{u \in J_0} \ \dfrac{P_0}{N_0} \ (1 + j_n) \ P^{(e)}(0,n+u) \ \biggl(1 - \sum_{k=0}^{n-1} {}_k p_{[x]}^{(m)} q_{[x],k}^{(m)} \biggr) \biggl(1 - \sum_{k=0}^{n-1} {}_k p_{[x]}^{(i)} q_{[x],k}^{(i)} \biggr) 
+$$
+
+### Anualidad del cónyuge
+
+Esta es la anualidad que se paga por la cobertura del cónyuge. En esta anualidad se tienen que dar 3 condiciones para que se mantenga activa: que no haya muerto el asegurado, que no haya quedado inválido, que no haya muerto el cónyuge. Así, el flujo sería:
+
+$$
+\mathbb{E}^{\widetilde{Q}}[H_1^{P}] = \\= P_1 \ \sum_{n=1}^{14} \sum_{u \in J_0} \ \dfrac{P_1}{N_0} \ (1 + j_n) \ P^{(e)}(0,n+u) \ \mathbb{P}(\; n < T_y^{(m)} ) \ \mathbb{P}(\; n < T_x^{(m)} ) \ \mathbb{P}( n < T_x^{(i)} \,) \\ = P_1 \ \sum_{n=1}^{14} \sum_{u \in J_0} \ \dfrac{P_1}{N_0} \ (1 + j_n) \ P^{(e)}(0,n+u) \ \biggl(1 - \sum_{k=0}^{n-1} {}_k p_{[y]}^{(m)} q_{[y],k}^{(m)} \biggr)  \biggl(1 - \sum_{k=0}^{n-1} {}_k p_{[x]}^{(m)} q_{[x],k}^{(m)} \biggr) \biggl(1 - \sum_{k=0}^{n-1} {}_k p_{[x]}^{(i)} q_{[x],k}^{(i)} \biggr) 
+$$
+
+## Función de pérdidas
+
+La función de pérdidas se puede analizar desde dos aristas: la del asegurado y la del cónyuge.
+
+### Pérdida asociada a la cobertura del asegurado
+
+Recordando que bajo el principio de equivalencia la esperanza de la variable de pérdida se iguala a cero, se tendría que:
+
+$$
+\mathbb{E}^{\widetilde{Q}}[L_o^{P_0}] = \mathbb{E}^{\widetilde{Q}}[H_0^{(m)}] + \mathbb{E}^{\widetilde{Q}}[H_0^{(i)}] + \mathbb{E}^{\widetilde{Q}}[G] - \mathbb{E}^{\widetilde{Q}}[H_0^{(P)}] = 0 \\ \implies b \ \sum_{t=0}^{179} P(0, (t+1)+R) \ * \ 1,2 \ * \ {}_t p_{[x]}^{'(m)} q_{[x],t}^{'(m)} \\ + \ b \sum_{t=0}^{179} P(0, (t+1)+R) \ 0,655 \ * \ {}_t p_{[x]}^{(i)} q_{[x],t}^{(i)} * \biggl(1 - \sum_{k=0}^t {}_k p_{[x]}^{(m)} q_{[x],k}^{(m)} \biggr) \\ + \ M \ \sum_{t=0}^{179} \ P^{(e)}(0,t) \ \biggl(1 - \sum_{k=0}^{t-1} {}_k p_{[x]}^{'(m)} q_{[x],k}^{'(m)} \biggr) \\ - \ P_0 \ \sum_{n=1}^{14} \sum_{u \in J_0} \ \dfrac{P_0}{N_0} \ (1 + j_n) \ P^{(e)}(0,n+u) \ \biggl(1 - \sum_{k=0}^{n-1} {}_k p_{[x]}^{(m)} q_{[x],k}^{(m)} \biggr) \biggl(1 - \sum_{k=0}^{n-1} {}_k p_{[x]}^{(i)} q_{[x],k}^{(i)} \biggr) = 0
+$$
+
+Pasando el negativo del flujo de la anualidad al otro lado de la igualdad y despejando la prima se obtiene:
+
+$$
+P_0 = \biggl( b \ \sum_{t=0}^{179} P(0, (t+1)+R) \ * \ 1,2 \ * \ {}_t p_{[x]}^{'(m)} q_{[x],t}^{'(m)} \\ + \ b \sum_{t=0}^{179} P(0, (t+1)+R) \ 0,655 \ * \ {}_t p_{[x]}^{(i)} q_{[x],t}^{(i)} * \biggl(1 - \sum_{k=0}^t {}_k p_{[x]}^{(m)} q_{[x],k}^{(m)} \biggr) \\ + \ M \ \sum_{t=0}^{179} \ P^{(e)}(0,t) \ \biggl(1 - \sum_{k=0}^{t-1} {}_k p_{[x]}^{'(m)} q_{[x],k}^{'(m)} \biggr) \biggr)/ \biggl( 1 + \dfrac{\sum_{k= 1}^{14} (1+0,0001)^n \biggl(1 - \sum_{k=0}^{n-1} {}_k p_{[x]}^{(m)} q_{[x],k}^{(m)} \biggr) \biggl(1 - \sum_{k=0}^{n-1} {}_k p_{[x]}^{(i)} q_{[x],k}^{(i)} \biggr) \sum_{u\in J_0} P^{(e)}(0,12n+u)}{12} \biggr)
+$$
+
+### Pérdida asociada a la cobertura del conyuge 
+
+Análogo al caso previo, utilizando el principio de equivalencia, se tendría que la función de pérdida y la $P_1$ estarían dadas por:
+
+$$
+\mathbb{E}^{\widetilde{Q}}[L_0^{P_1}] = \mathbb{E}^{\widetilde{Q}}[H_1^{(m)}] - \mathbb{E}^{\widetilde{Q}}[H_1^{P}] = 0 \\ \implies b \sum_{t=0}^{179} P(0, (t+1) + R) \ {}_t p_{[y]}^{(m)} q_{[y],t}^{(m)} * \biggl(1 - \sum_{k=0}^t {}_k p_{[x]}^{(m)} q_{[x],k}^{(m)} \biggr) \\ - P_1 \ \sum_{n=1}^{14} \sum_{u \in J_0} \ \dfrac{P_1}{N_0} \ (1 + j_n) \ P^{(e)}(0,n+u) \ \biggl(1 - \sum_{k=0}^{n-1} {}_k p_{[y]}^{(m)} q_{[y],k}^{(m)} \biggr)  \biggl(1 - \sum_{k=0}^{n-1} {}_k p_{[x]}^{(m)} q_{[x],k}^{(m)} \biggr) \biggl(1 - \sum_{k=0}^{n-1} {}_k p_{[x]}^{(i)} q_{[x],k}^{(i)} \biggr) = 0 \\ \implies P_1 = \dfrac{\biggl(b \sum_{t=0}^{179} P(0, (t+1) + R) \ {}_t p_{[y]}^{(m)} q_{[y],t}^{(m)} * \biggl(1 - \sum_{k=0}^t {}_k p_{[x]}^{(m)} q_{[x],k}^{(m)} \biggr) \biggr)}{\biggl( 1 + \dfrac{\sum_{k= 1}^{14} (1+0,0001)^n \biggl(1 - \sum_{k=0}^{n-1} {}_k p_{[y]}^{(m)} q_{[y],k}^{(m)} \biggr) \biggl(1 - \sum_{k=0}^{n-1} {}_k p_{[x]}^{(m)} q_{[x],k}^{(m)} \biggr) \biggl(1 - \sum_{k=0}^{n-1} {}_k p_{[x]}^{(i)} q_{[x],k}^{(i)} \biggr) \sum_{u\in J_0} P^{(e)}(0,12n+u)}{12} \biggr)}
+$$
+
+# Implementación de la simulación del valor esperado
+
+Teniendo lo anterior a la mano, lo primero que se desarrolla es una función para obtener las probabilidad de un determinado decremento para un momento específico, una edad particular y dada una matriz de probabilidades individuales o en competencia.
+
+La formulación a seguir es:
+
+$$
+1 = q_{[x]}^{'(i)} + p_{[x]}^{'(i)} q_{[x],1}^{'(i)} + {}_2 p_{[x]}^{'(i)} q_{[x],2}^{'(i)} + ... + {}_{179} p_{[x]}^{'(i)} q_{[x],179}^{'(i)} + {}_{180} p_{[x]}^{'(i)}
+$$
+
+Con lo cual, lo que se quiere es obtener cada uno de los elementos de dicha suma con el fin de establecer un vector de probabilidad con los mismos. La función consiguiente se encarga de determinar cada uno de lo sumandos.
+
+```{r}
+
+probabilidades_invalidez <- function(t, edad, invalidez){
+  
+  edad <- ((edad-1)*12)+1
+
+  ifelse(t==0, valor <-invalidez[edad,2],
+         ifelse(t < 180, valor <- cumprod((1 - invalidez[edad:(edad+t-1),2]))*invalidez[(edad+1):(edad+t),2],
+                valor <- cumprod((1 - invalidez[edad:(edad+t-1),2]))[length(cumprod((1 -invalidez[edad:(edad+t-1),2])))]))
+
+  valor
+}
+
+# Prueba
+
+#probabilidades_invalidez(180, 35, probabilidades[,c(1,5)])
+
+```
+
+Para el caso de las probabilidades de muerte, se tiene que la formulación es la siguiente:
+
+$$
+1 = \sum_{t=0}^{179}  (\mathbb{P}(t < T_x^{(m)} < t+1, \ t \leq T_y^{(m)}) + \mathbb{P}(t+1\leq T_x^{(m)}, \ t \leq T_y^{(m)} < t+1)) + \mathbb{P}(180 \leq T_x^{(m)}, \ 180 \leq T_y^{(m)})
+$$
+
+Así, se crean dos funciones: Una para determinar el primero de los sumandos, es decir, la probabilidad de que el asegurado muera entre el momento t y el momentto t+1 y que el cónyuge muera despúes del momento t; y otra para la probabilidad de que el cónyuge muera antes de que el asegurado lo haga.
+
+```{r}
+
+# En este caso, se pagarían las dos muertes
+
+probabilidad_muerte_separada <- function(t, edad_a, edad_c, muerte_a, muerte_c){
+  
+  edad_a <- ((edad_a-1)*12)+1
+  edad_c <- ((edad_c-1)*12)+1
+  
+  ifelse(t==0, valor <- muerte_c[edad_c,2] * (1 - muerte_a[edad_a,2]),
+         valor <- cumprod(1 - muerte_c[edad_c:(edad_c+t-1),2])[length(cumprod(1 - muerte_c[edad_c:(edad_c+t-1),2]))] *
+           muerte_c[(edad_c+t),2] * (1 - muerte_a[edad_a,2] - sum(cumprod((1 -muerte_a[edad_a:(edad_a+t-1),2]))*
+                                                                    muerte_a[(edad_a+1):(edad_a+t),2])))
+  
+  valor
+}
+
+probabilidad_muerte_separada(2, 35, 35, probabilidades[,c(1,3)], probabilidades[,c(1,4)])
+
+# Este es el caso en el que el decremento de la muerte del conyuge sucede en el mismo mes que el del asegurado o posterior a. En este caso solo se paga el beneficio del último.
+
+probabilidad_muerte_asegurado_primero <- function(t, edad_a, edad_c, muerte_a, muerte_c){
+  
+  edad_a <- ((edad_a-1)*12)+1
+  edad_c <- ((edad_c-1)*12)+1
+
+  ifelse(t == 0, valor <- muerte_a[edad_a, 2],
+       ifelse(t == 1, 
+              valor <- (1-muerte_a[edad_a, 2])*muerte_a[(edad_a+t), 2] * (1-muerte_c[edad_c,2]),
+              valor <- cumprod(1 - muerte_a[edad_a:(edad_a+t-1),2])[length(cumprod(1 - muerte_a[edad_a:(edad_a+t-1),2]))] *
+                muerte_a[(edad_a+t),2] * (1-muerte_c[edad_c, 2] - sum(cumprod((1 - muerte_c[edad_c:(edad_c+t-2),2]))*
+                                                                      muerte_c[(edad_c+1):(edad_c+t-1),2]))))
+  valor
+}
+
+# Prueba de la función
+probabilidad_muerte_asegurado_primero(3, 35, 35, muerte_a = probabilidades[,c(2,3)], muerte_c = probabilidades[,c(2,4)])
+
+```
+
+## Función general para el modelo estocástico
+
+Lo primero es poder encontrar las primas que se van a cobrar con ambas coberturas. 
+
+### Primas
+
+Primeramente se realiza la función para encontrar la del asegurado, dada una suma asegurada b, una periodicidad de pagos $N_0$, y la edad de la persona.
+
+```{r}
+
+# Esta función se utiliza para programar los flujos dentro de la anualidad pagadera por parte del asegurado. Por flujos se hace referencia a los valores que se "despejan" de la prima en pro de pasarlos al otro lado de la igualdad para obtener la misma.
+
+flujo <- function(n, muerte, incapacidad, edad, N_0){
+
+  edad <- ((edad-1)*12)+1
+  valor <- (1+0.0001)^n * 
+  (1 - sum(c(1, cumprod((1 -muerte[edad:(edad+(12*n)-2),2]))) * 
+             muerte[edad:(edad+(12*n)-1),2]))*
+    (1 - sum(c(1, cumprod((1 -incapacidad[edad:(edad+(12*n)-2),2])))*
+             incapacidad[edad:(edad+(12*n)-1),2])) *
+  sum(unlist(seq((12*n),((12*n)+11), by = (12/N_0)) %>% map(precio_cero_cupon_udes)))
+  valor
+}
+
+# Función para la prima flat
+
+prima_0 <- function(b, N_0, edad, muerte, incapacidad, muerte_en_competencia, incapacidad_en_competencia){
+    
+  flujo <- (sum(unlist(seq(1,14) %>% 
+         map(flujo, muerte = muerte, incapacidad = incapacidad, edad = edad,  N_0=N_0)))/N_0) + 1
+  
+  edad <- ((edad-1)*12)+1
+  
+  prima <- (sum(((unlist(seq(2,181) %>% map(precio_cero_cupon_colones))*0.15 + 
+  unlist(seq(3,182) %>% map(precio_cero_cupon_colones))*0.25 +
+  unlist(seq(4,183) %>% map(precio_cero_cupon_colones))*0.2 +
+  unlist(seq(5,184) %>% map(precio_cero_cupon_colones))*0.4) * b * 
+    ((1.2 * c(1,cumprod((1-muerte[edad:(edad+178),2])))*muerte[edad:(edad+179),2]) +
+  (0.655*c(1,cumprod((1-incapacidad_en_competencia[edad:(edad+178),2])))*incapacidad_en_competencia[edad:(edad+179),2] * 
+     (1- cumsum(c(1, cumprod((1 -muerte_en_competencia[edad:(edad+179-1),2])))*
+                  muerte_en_competencia[(edad):(edad+179),2]))))) +
+    (50000 * c(1, unlist((1:179) %>% map(precio_cero_cupon_udes))) * 
+       (c(1, (1-muerte[edad, 2] - c(0, cumsum(cumprod((1 -muerte[edad:(edad+179-2),2]))*
+                                                muerte[(edad+1):(edad+179-1),2]))))))))/flujo
+  prima
+  
+}
+
+prima_0(5000000, 1, 65, muerte = probabilidades[,c(2,3)], incapacidad = probabilidades[,c(2,5)],
+        muerte_en_competencia = probabilidades_en_competencia[,c(2,3)],
+        incapacidad_en_competencia = probabilidades_en_competencia[,c(2,5)])
+
+```
+
+Análogo al caso previo, se programa la función para determinar la prima para el seguro del cónyuge.
+
+```{r}
+
+flujo_1 <- function(n, muerte, muerte_c, incapacidad, edad_a, edad_c, N_0){
+
+  edad_a <- ((edad_a-1)*12)+1
+  edad_c <- ((edad_c-1)*12)+1
+  valor <- (1+0.0001)^n * 
+    (1 - sum(c(1, cumprod((1 -muerte_c[edad_c:(edad_c+(12*n)-2),2]))) * 
+             muerte_c[edad_c:(edad_c+(12*n)-1),2])) *
+  (1 - sum(c(1, cumprod((1 -muerte[edad_a:(edad_a+(12*n)-2),2]))) * 
+             muerte[edad_a:(edad_a+(12*n)-1),2]))*
+    (1 - sum(c(1, cumprod((1 -incapacidad[edad_a:(edad_a+(12*n)-2),2])))*
+             incapacidad[edad_a:(edad_a+(12*n)-1),2])) *
+  sum(unlist(seq((12*n),((12*n)+11), by = (12/N_0)) %>% map(precio_cero_cupon_udes)))
+  valor
+}
+
+prima_1 <- function(b, N_0, edad_a, edad_c, muerte, muerte_c, muerte_en_competencia_a, incapacidad, muerte_en_competencia_c){
+  
+  flujo_c <- (sum(unlist(seq(1,14) %>% 
+         map(flujo_1, muerte = muerte, muerte_c= muerte_c, incapacidad = incapacidad, 
+             edad_a = edad_a, edad_c = edad_c, N_0=N_0)))/N_0) + 1
+  
+  edad_a <- ((edad_a-1)*12)+1
+  edad_c <- ((edad_c-1)*12)+1
+  
+  prima <- (sum((unlist(seq(2,181) %>% map(precio_cero_cupon_colones))*0.15 + 
+  unlist(seq(3,182) %>% map(precio_cero_cupon_colones))*0.25 +
+  unlist(seq(4,183) %>% map(precio_cero_cupon_colones))*0.2 +
+  unlist(seq(5,184) %>% map(precio_cero_cupon_colones))*0.4) * b * 
+    (c(1,cumprod((1-muerte_en_competencia_c[edad_c:(edad_c+178),2])))*muerte_en_competencia_c[edad_c:(edad_c+179),2] * 
+              (1- cumsum(c(1, cumprod((1 -muerte_en_competencia_a[edad_a:(edad_a+179-1),2]))) *
+                           muerte_en_competencia_a[(edad_a):(edad_a+179),2])))))/flujo_c
+  
+  prima
+  
+}
+
+prima_1(5000000, 12, edad_a = 35, edad_c = 33, muerte = probabilidades[,c(1,3)], incapacidad = probabilidades[,c(1,5)], 
+        muerte_c = probabilidades[,c(1,4)], muerte_en_competencia_a = probabilidades_en_competencia[,c(2,3)],
+        muerte_en_competencia_c = probabilidades_en_competencia[,c(2,4)])
+
+```
+
+### Función de pérdida
+
+La función de pérdida que se presenta a continuación toma en consideración los diversos escenarios para el caso en el que existe una cobertura tanto para el asegurado como para el cónyuge. Esta se fragmenta en dos partes, una funcion L_0 en donde se abarcan los distintos casos y una función denominada pérdidas estocásticas, en donde se determinan los distintos valores estocásticos para los tiempos de muerte, el tiempo de discapacidad, el rezago, y las diversas severidades. Con esta información se llama a la función L_0, la cual devuelve la pérdida estimada. 
+
+```{r}
+
+# Función de pérdida 
+
+flujo_efectivo <- function(n, N_0){
+
+  valor <- sum((1 + 0.0001)^n * unlist(seq((12*n),((12*n)+11), by = (12/N_0)) %>% map(precio_cero_cupon_udes)))
+  valor
+  
+}
+
+L_0 <- function(P_0, P_1, N_0, b, muerte, incapacidad, rezago, tiempo_muerte, 
+                tiempo_incapacidad, severidad_incapacidad, severidad_muerte, tiempo_muerte_asegurado,
+                prob_muerte_asegurado){
+  
+muerte_a <- muerte
+  
+  if(tiempo_muerte==361){
+    
+    if(tiempo_incapacidad > 180){
+      # Se recibieron todas las primas y no se pagó nada
+      
+      gastos <- 50000 * sum(unlist(c(1,seq(1,179) %>% map(precio_cero_cupon_udes))))
+      perdida <- gastos - (sum((P_0/N_0)*(unlist(seq(1,14) %>% map(flujo_efectivo, N_0= N_0)))) + P_0)
+    }
+    else{
+      # Se recibieron las primas hasta el momento de la incapacidad. Dado que la aseguradora se asegura el año vigente de
+      # primas, basta con tomar la parte entera para hacer el cálculo de las mismas. Se resta una unidad correspondiente
+      # a la prima del año incial que ya se da por sentado que se obtiene.
+      
+      pago <- b * severidad_incapacidad * precio_cero_cupon_colones(tiempo_incapacidad+1+rezago)
+      años <- floor(tiempo_incapacidad/12) - 1
+      ifelse(años >= 1, 
+       ingresos <- sum((P_0/N_0)*(unlist(seq(1,años) %>% map(flujo_efectivo, N_0= N_0)))) + P_0, 
+       ingresos <- P_0) 
+      gastos <- 50000 * sum(unlist(c(1,seq(1,179) %>% map(precio_cero_cupon_udes))))
+      perdida <- pago + gastos - ingresos
+      
+    }
+  }
+  if(tiempo_muerte %% 2 == 0){
+    # Caso en el que el asegurado muere primero o en el mismo mes que el conyuge, pagando así solo la muerte del primero.
+    
+    if(tiempo_incapacidad >= (tiempo_muerte/2)){
+      
+      # Se reciben primas hasta la muerte del asegurado y solo se paga la muerte de este
+      
+      pago <- b * severidad_muerte * precio_cero_cupon_colones(tiempo_muerte+1+rezago)
+      gastos <- 50000 * sum(unlist(c(1,seq(1,(tiempo_muerte/2)) %>% map(precio_cero_cupon_udes))))
+      años <- floor(tiempo_muerte/24) - 1
+      ifelse(años >= 1, 
+       ingresos <- sum((P_0/N_0)*(unlist(seq(1,años) %>% map(flujo_efectivo, N_0= N_0)))) + P_0, 
+       ingresos <- P_0) 
+      perdida <- pago + gastos - ingresos
+      
+    }
+    else{
+      
+      #Se recibieron las primas hasta el momento de la incapacidad y se paga la muerte del asegurado en su momento
+      
+      pago <- (b * severidad_incapacidad * precio_cero_cupon_colones(tiempo_incapacidad + 1 + rezago)) +
+        (b * severidad_muerte * precio_cero_cupon_colones(tiempo_muerte+1+rezago))
+      gastos <- 50000 * sum(unlist(c(1,seq(1,(tiempo_muerte/2)) %>% map(precio_cero_cupon_udes))))
+      años <- floor(tiempo_incapacidad/12) - 1 # Cantidad de años que se reciben primas
+      ifelse(años >= 1, 
+       ingresos <- sum((P_0/N_0)*(unlist(seq(1,años) %>% map(flujo_efectivo, N_0= N_0)))) + P_0, 
+       ingresos <- P_0) 
+      perdida <- pago + gastos - ingresos
+      
+    }
+  }
+  if(tiempo_muerte %% 2 != 0){
+    # Caso en el que el asegurado muere después que el conyuge
+    
+    # Se crea el vector de probabilidades de muerte unicamente para el asegurado.
+    # Se toman los periodos posteriores a la muerte del cónyuge.
+    
+    if(tiempo_muerte_asegurado == length(prob_muerte_asegurado)){ # Si el asegurado sobrevive hasta el final del seguro
+      
+      if(tiempo_incapacidad == 181){
+        
+        # Si el asegurado nunca llega a un estado de discapacidad
+        
+        años <- floor(tiempo_muerte/24) - 1
+        ifelse(años >= 1, 
+       ingresos <- sum((P_0/N_0)*(unlist(seq(1,14) %>% map(flujo_efectivo, N_0= N_0)))) + P_0 + 
+          sum((P_1/N_0)*(unlist(seq(1,años) %>% map(flujo_efectivo, N_0= N_0)))) + P_1, 
+       ingresos <- sum((P_0/N_0)*(unlist(seq(1,14) %>% map(flujo_efectivo, N_0= N_0)))) + P_0 + P_1) 
+        pago <- b * precio_cero_cupon_colones(round(tiempo_muerte/2)+1+rezago)
+        gastos <- 50000 * sum(unlist(c(1,seq(1,179) %>% map(precio_cero_cupon_udes))))
+        perdida <- pago + gastos - ingresos
+        
+      }
+      if((tiempo_muerte/2) <= tiempo_incapacidad & tiempo_incapacidad < 181){
+        
+        # Si la discapacidad se da entre la muerte del cónyuge y el final del seguro
+        
+        años_1 <- floor(tiempo_muerte/24) - 1
+        años_2 <- floor(tiempo_incapacidad/12) - 1
+        ifelse(años_1 >= 1,
+               ifelse(años_2 >= 1, 
+                      ingresos <- sum((P_0/N_0)*(unlist(seq(1,años_2) %>% map(flujo_efectivo, N_0= N_0)))) + P_0 +
+                        sum((P_1/N_0)*(unlist(seq(1,años_1) %>% map(flujo_efectivo, N_0= N_0)))) + P_1,
+                      ingresos <- P_0 +sum((P_1/N_0)*(unlist(seq(1,años_1) %>% map(flujo_efectivo, N_0= N_0)))) + P_1),
+               ifelse(años_2 >= 1, 
+                      ingresos <- sum((P_0/N_0)*(unlist(seq(1,años_2) %>% map(flujo_efectivo, N_0= N_0)))) + P_0 + P_1,
+                      ingresos <- P_0 + P_1)
+               )
+        pago <- (b * precio_cero_cupon_colones(round(tiempo_muerte/2)+1+rezago)) + 
+          (b * severidad_incapacidad * precio_cero_cupon_colones(tiempo_incapacidad + 1 + rezago))
+        gastos <- 50000 * sum(unlist(c(1,seq(1,179) %>% map(precio_cero_cupon_udes))))
+        perdida <- pago + gastos - ingresos
+      }
+      
+      if( tiempo_incapacidad < (tiempo_muerte/2) & (tiempo_muerte/2) < 181){
+        
+        # Si la discapacidad se da antes de la muerte del cónyuge
+        
+        años <- floor(tiempo_incapacidad/12) - 1
+        ifelse(años >= 1, 
+               ingresos <- sum((P_0/N_0)*(unlist(seq(1:años) %>% map(flujo_efectivo, N_0= N_0)))) + P_0 +
+                 sum((P_1/N_0)*(unlist(seq(1:años) %>% map(flujo_efectivo, N_0= N_0)))) + P_1,
+               ingresos <- P_0 + P_1)
+        pago <- (b * precio_cero_cupon_colones(round(tiempo_muerte/2)+1+rezago)) + 
+          (b * severidad_incapacidad * precio_cero_cupon_colones(tiempo_incapacidad + 1 + rezago))
+        gastos <- 50000 * sum(unlist(c(1,seq(1,179) %>% map(precio_cero_cupon_udes))))
+        perdida <- pago + gastos - ingresos
+        
+      }
+    }
+    else{ # Si el asegurado muere antes de que finalice el seguro
+    
+      if((round(tiempo_muerte/2) + tiempo_muerte_asegurado) <= tiempo_incapacidad){
+      
+      # Este es el caso en el que el asegurado muere después del cónyuge, y dicha muerte ocurre antes o simultaneamente
+      # con la incapacidad. En dado caso, se recibe la P_1 hasta la muerte del cónyuge y la P_o hasta que sucede el 
+      # fallecimiento del asegurado. Cabe destacar que acá solo se pegan las dos muertes, pues el seguro de incapacidad
+      # no aplica.
+        
+        años_1 <- floor((round(tiempo_muerte/2) + tiempo_muerte_asegurado)/12) - 1
+        años_2 <- floor(round(tiempo_muerte/2)/12) - 1
+        ifelse(años_1 >= 1,
+              ifelse(años_2 >= 1, 
+                    ingresos <- sum((P_0/N_0)*(unlist(seq(1,años_1) %>% map(flujo_efectivo, N_0= N_0)))) + P_0 +
+                      sum((P_1/N_0)*(unlist(seq(1,años_2) %>% map(flujo_efectivo, N_0= N_0)))) + P_1,
+                    ingresos <- sum((P_0/N_0)*(unlist(seq(1,años_1) %>% map(flujo_efectivo, N_0= N_0)))) + P_0 + P_1),
+             ifelse(años_2 >= 1, 
+                    ingresos <- P_0 + sum((P_1/N_0)*(unlist(seq(1,años_2) %>% map(flujo_efectivo, N_0= N_0)))) + P_1,
+                    ingresos <- P_0 + P_1)
+             )
+        pago <- (b * precio_cero_cupon_colones(round(tiempo_muerte/2)+1+rezago)) + 
+          (b * severidad_muerte * 
+             precio_cero_cupon_colones((round(tiempo_muerte/2) + tiempo_muerte_asegurado) + 1 + rezago))
+        gastos <- 50000 * sum(unlist(c(1,seq(1,(round(tiempo_muerte/2) + tiempo_muerte_asegurado)) %>%
+                                         map(precio_cero_cupon_udes))))
+        perdida <- pago + gastos - ingresos
+      
+      }
+      if(tiempo_incapacidad < (round(tiempo_muerte/2) + tiempo_muerte_asegurado)){
+      
+        años_1 <- floor(tiempo_incapacidad/12) - 1
+        años_2 <- floor(min(tiempo_incapacidad, round(tiempo_muerte/2))/12) - 1
+        ifelse(años_1 >= 1,
+              ifelse(años_2 >= 1, 
+                    ingresos <- sum((P_0/N_0)*(unlist(seq(1,años_1) %>% map(flujo_efectivo, N_0= N_0)))) + P_0 +
+                      sum((P_1/N_0)*(unlist(seq(1,años_2) %>% map(flujo_efectivo, N_0= N_0)))) + P_1,
+                    ingresos <- sum((P_0/N_0)*(unlist(seq(1,años_1) %>% map(flujo_efectivo, N_0= N_0)))) + P_0 + P_1),
+             ifelse(años_2 >= 1, 
+                    ingresos <- P_0 + sum((P_1/N_0)*(unlist(seq(1,años_2) %>% map(flujo_efectivo, N_0= N_0)))) + P_1,
+                    ingresos <- P_0 + P_1)
+             )
+        pago <- (b * precio_cero_cupon_colones(round(tiempo_muerte/2)+1+rezago)) + 
+          (b * severidad_muerte * 
+             precio_cero_cupon_colones((round(tiempo_muerte/2) + tiempo_muerte_asegurado) + 1 + rezago)) +
+          (b * severidad_incapacidad * precio_cero_cupon_colones(tiempo_incapacidad +1 + rezago))
+        gastos <- 50000 * sum(unlist(c(1,seq(1,(round(tiempo_muerte/2) + tiempo_muerte_asegurado)) %>%
+                                         map(precio_cero_cupon_udes))))
+        perdida <- pago + gastos - ingresos
+        
+      }
+      
+    }  
+  }
+  
+  perdida
+}
+
+```
+
+Primero se determina el vector de probabilidades para la discapacidad. Luego se aplica una multinomial utilizando dicho vector, obteniendo así un momento estocástico en el que ocurre el decremento. Este mismo proceso se aplica para los demás elementos.
+
+Un caso que se diferencia es el de la muerte. Acá se crea un vector de probabilidad donde las entradas impares son las probabilidades de que el cónyuge muera entre el momento t y t+1 y el asegurado muera después de t+1, y las entradas pares son las probabilidades de que el asegurado muera primero. Cabe recordar que si el asegurado muere primero, el seguro del cónyuge pierde su vigencia; mientras que si el cónyuge muere primero, el seguro del asegurado continua funcionando. Finalmente, se agrega una última entrada que es la probabilidades de que ambas vidas sobrevivan a los 15 años del seguro.
+
+Así, si el cónyuge llegase a morir primero, entonces se prosigue a tomar las probabilidades de muerte del asegurado de manera individual con el fin de determinar cuando se produciría su muerte a posteriori (si es que se llega a dar).
+
+```{r}
+
+perdidas_estocasticas <- function(vector){
+
+  edad_a <- unlist(vector)[2]
+  edad_c <- unlist(vector)[6]
+  ifelse(unlist(vector)[3]==1, invalidez <- probabilidades[,c(1,5)], invalidez <- probabilidades[,c(1,6)])
+  ifelse(unlist(vector)[3]==1, muerte_a <- probabilidades[,c(1,3)], muerte_a <- probabilidades[,c(1,4)])
+  ifelse(unlist(vector)[7] == 1, muerte_c <- probabilidades[,c(1,3)], muerte_c <- probabilidades[,c(1,4)])
+  ifelse(unlist(vector)[3]==1, muerte_en_competencia_a <- probabilidades_en_competencia[, c(2,3)],
+         muerte_en_competencia_a <- probabilidades_en_competencia[, c(2,4)])
+  ifelse(unlist(vector)[7]==1, muerte_en_competencia_c <- probabilidades_en_competencia[, c(2,3)],
+         muerte_en_competencia_c <- probabilidades_en_competencia[, c(2,4)])
+  ifelse(unlist(vector)[3]==1, invalidez_en_competencia <- probabilidades_en_competencia[,c(2,5)],
+         invalidez_en_competencia <- probabilidades_en_competencia[,c(2,6)])
+  b <- unlist(vector)[1]
+  N_0 <- unlist(vector)[4]
+  
+  # se crea el vector de probabilidades de invalidez y se determina el momento estocástico en el que ocurre
+    
+  prob_invalidez <- c(probabilidades_invalidez(0, edad = edad_a, invalidez), 
+                      probabilidades_invalidez(179, edad = edad_a, invalidez),
+                      probabilidades_invalidez(180, edad = edad_a, invalidez))
+  
+  tiempo_incapacidad <- which(rmultinom(n=1, size = 1, prob = prob_invalidez)==1)
+  
+  # se crea el vector de probabilidades de muerte y se determina el momento estocástico en el que ocurre
+  
+  prob_muerte_1 <- unlist(seq(0,179) %>% map(probabilidad_muerte_separada, edad_a = edad_a, edad_c= edad_c, 
+                                        muerte_a=muerte_a, muerte_c=muerte_c))
+  prob_muerte_2 <- unlist(seq(0,179) %>% map(probabilidad_muerte_asegurado_primero, edad_a = edad_a, edad_c=edad_c,
+                                        muerte_a=muerte_a, muerte_c=muerte_c))
+  
+  prob_muerte_total <- unlist(c(rbind(prob_muerte_1, prob_muerte_2), 
+                                ((1- sum(cumprod((1-muerte_a[(((edad_a-1)*12)+1):((((edad_a-1)*12)+1)+179-1),2]))*
+                                           muerte_a[((((edad_a-1)*12)+1)+1):((((edad_a-1)*12)+1)+179),2])) 
+                                 *(1- sum(cumprod((1 - muerte_c[(((edad_c-1)*12)+1):((((edad_c-1)*12)+1)+179-1),2]))*
+                                            muerte_c[((((edad_c-1)*12)+1)+1):((((edad_c-1)*12)+1)+179),2])))))
+  
+  # El último elemento del vector c() es la probabilidad de que ambas muertes sean despues del periodo de los 180 meses.
+  
+  tiempo_muerte <- which(rmultinom(n=1, size = 1, prob = prob_muerte_total)==1)
+  
+  # Tiempo de muerte del asegurado en el caso de que el cónyuge muera antes.
+  
+  prob_muerte_asegurado <- c(probabilidades_invalidez(0, edad = edad_a, muerte_a), 
+      probabilidades_invalidez(179, edad = edad_a, muerte_a),
+      probabilidades_invalidez(180, edad = edad_a, muerte_a))[(round(tiempo_muerte/2)+1):181]
+  
+  tiempo_muerte_asegurado <- which(rmultinom(n=1, size = 1, prob = prob_muerte_asegurado)==1)
+  
+  # Tipo de severidad para la incapacidad
+  
+  Sever_incapacidad <- which(rmultinom(n=1, size = 1, prob = c(0.25, 0.25, 0.2, 0.2, 0.07, 0.03))==1)
+  ifelse(Sever_incapacidad == 1, severidad_incapacidad <-1/6, 
+         ifelse(Sever_incapacidad == 2, severidad_incapacidad <-1/3, 
+                ifelse(Sever_incapacidad == 3, severidad_incapacidad <-1/2, 
+                       ifelse(Sever_incapacidad == 4, severidad_incapacidad <-1,
+                              ifelse(Sever_incapacidad == 5, severidad_incapacidad <-2, severidad_incapacidad <-3)))))
+  
+  # Tipo de severidad para la muerte
+  
+  severidad_muerte <- which(rmultinom(n=1, size = 1, prob = c(0.85, 0.1, 0.05))==1)
+
+  
+  # Cálculo del rezago
+  
+  rezago <- which(rmultinom(n=1, size = 1, prob = c(0.15, 0.25, 0.2, 0.4))==1)
+  
+  p_0 <- prima_0(b = b, N_0 = N_0, edad = edad_a, muerte = muerte_a, incapacidad = invalidez, 
+                 muerte_en_competencia =  muerte_en_competencia_a, incapacidad_en_competencia = invalidez_en_competencia)
+  p_1 <- prima_1(b = b, N_0 = N_0, edad_a = edad_a, edad_c = edad_c, muerte = muerte_a, 
+                 incapacidad = invalidez, muerte_c = muerte_c, muerte_en_competencia_a = muerte_en_competencia_a, 
+                 muerte_en_competencia_c = muerte_en_competencia_c)
+  
+  perdida <- L_0(P_0=p_0, P_1 = p_1, N_0 = N_0, b = b, muerte = muerte_a, 
+                 incapacidad = invalidez, rezago = rezago, tiempo_muerte = tiempo_muerte, 
+                 tiempo_incapacidad = tiempo_incapacidad, severidad_incapacidad = severidad_incapacidad, 
+                 severidad_muerte = severidad_muerte, tiempo_muerte_asegurado, 
+                 prob_muerte_asegurado = prob_muerte_asegurado)
+
+  return(perdida)
+}
+
+# Prueba
+replicate(50, perdidas_estocasticas(población_asegurada[2,]))
+
+```
+
+El siguiente es el caso de la variable de pérdida para cuando no existe una cobertura para el cónyuge. Es análogo al anterior.
+
+```{r}
+
+L_1 <- function(P_0, N_0, b, rezago, tiempo_muerte_asegurado, tiempo_incapacidad,
+                severidad_incapacidad, severidad_muerte){
+
+  if(tiempo_muerte_asegurado==181){
+    
+    if(tiempo_incapacidad > 180){
+      # Se recibieron todas las primas y no se pagó nada
+      
+      gastos <- 50000 * sum(unlist(c(1,seq(1,179) %>% map(precio_cero_cupon_udes))))
+      perdida <- gastos - (sum((P_0/N_0)*(unlist(seq(1,14) %>% map(flujo_efectivo, N_0= N_0)))) + P_0)
+    } else{
+      # Se recibieron las primas hasta el momento de la incapacidad. Dado que la aseguradora se asegura el año vigente de
+      # primas, basta con tomar la parte entera para hacer el cálculo de las mismas. Se resta una unidad correspondiente
+      # a la prima del año incial que ya se da por sentado que se obtiene.
+      
+      pago <- b * severidad_incapacidad * precio_cero_cupon_colones(tiempo_incapacidad+1+rezago)
+      años <- floor(tiempo_incapacidad/12) - 1
+      ifelse(años >= 1, 
+       ingresos <- sum((P_0/N_0)*(unlist(seq(1,años) %>% map(flujo_efectivo, N_0= N_0)))) + P_0, 
+       ingresos <- P_0) 
+      gastos <- 50000 * sum(unlist(c(1,seq(1,179) %>% map(precio_cero_cupon_udes))))
+      perdida <- pago + gastos - ingresos
+      
+    }
+  }
+  
+  if(tiempo_muerte_asegurado < 181){
+    
+    if(tiempo_incapacidad <= tiempo_muerte_asegurado){
+      
+      ifelse(tiempo_incapacidad < tiempo_muerte_asegurado,
+             pago <- (b * severidad_incapacidad * precio_cero_cupon_colones(tiempo_incapacidad+1+rezago)) +
+        (b * severidad_muerte * precio_cero_cupon_colones(tiempo_muerte_asegurado+1+rezago)),
+        pago <- b * severidad_muerte * precio_cero_cupon_colones(tiempo_muerte_asegurado+1+rezago))
+      años <- floor(tiempo_incapacidad/12) - 1
+      ifelse(años >= 1, 
+       ingresos <- sum((P_0/N_0)*(unlist(seq(1,años) %>% map(flujo_efectivo, N_0= N_0)))) + P_0, 
+       ingresos <- P_0) 
+      gastos <- 50000 * sum(unlist(c(1,seq(1,tiempo_muerte_asegurado) %>% map(precio_cero_cupon_udes))))
+      perdida <- pago + gastos - ingresos
+      
+    } else{
+      
+      pago <- b * severidad_muerte * precio_cero_cupon_colones(tiempo_muerte_asegurado+1+rezago)
+      años <- floor(tiempo_muerte_asegurado/12) - 1
+      ifelse(años >= 1, 
+       ingresos <- sum((P_0/N_0)*(unlist(seq(1,años) %>% map(flujo_efectivo, N_0= N_0)))) + P_0, 
+       ingresos <- P_0) 
+      gastos <- 50000 * sum(unlist(c(1,seq(1,tiempo_muerte_asegurado) %>% map(precio_cero_cupon_udes))))
+      perdida <- pago + gastos - ingresos
+      
+    }
+    
+  }
+
+  perdida
+}
+
+```
+
+La función pérdidas estocásticas sin conyuge es análoga a su contraparte pérdidas estocásticas, pero aplicada al caso en el que no hay cobertura para el conyuge.
+
+```{r}
+
+perdidas_estocasticas_sin_conyuge <- function(vector){
+
+  edad_a <- unlist(vector)[2]
+  ifelse(unlist(vector)[3]==1, invalidez <- probabilidades[,c(1,5)], invalidez <- probabilidades[,c(1,6)])
+  ifelse(unlist(vector)[3]==1, muerte_a <- probabilidades[,c(1,3)], muerte_a <- probabilidades[,c(1,4)])
+  ifelse(unlist(vector)[3]==1, muerte_en_competencia_a <- probabilidades_en_competencia[, c(2,3)],
+         muerte_en_competencia_a <- probabilidades_en_competencia[, c(2,4)])
+  ifelse(unlist(vector)[3]==1, invalidez_en_competencia <- probabilidades_en_competencia[,c(2,5)],
+         invalidez_en_competencia <- probabilidades_en_competencia[,c(2,6)])
+  b <- unlist(vector)[1]
+  N_0 <- unlist(vector)[4]
+  
+  # se crea el vector de probabilidades de invalidez y se determina el momento estocástico en el que ocurre
+    
+  prob_invalidez <- c(probabilidades_invalidez(0, edad = edad_a, invalidez), 
+                      probabilidades_invalidez(179, edad = edad_a, invalidez),
+                      probabilidades_invalidez(180, edad = edad_a, invalidez))
+  
+  tiempo_incapacidad <- which(rmultinom(n=1, size = 1, prob = prob_invalidez)==1)
+
+  # Tiempo de muerte del asegurado en el caso de que el cónyuge muera antes.
+  
+   prob_muerte_asegurado <- c(probabilidades_invalidez(0, edad = edad_a, muerte_a), 
+      probabilidades_invalidez(179, edad = edad_a, muerte_a),
+      probabilidades_invalidez(180, edad = edad_a, muerte_a))[1:181]
+  
+  tiempo_muerte_asegurado <- which(rmultinom(n=1, size = 1, prob = prob_muerte_asegurado)==1)
+  
+  # Tipo de severidad para la incapacidad
+  
+  Sever_incapacidad <- which(rmultinom(n=1, size = 1, prob = c(0.25, 0.25, 0.2, 0.2, 0.07, 0.03))==1)
+  ifelse(Sever_incapacidad == 1, severidad_incapacidad <-1/6, 
+         ifelse(Sever_incapacidad == 2, severidad_incapacidad <-1/3, 
+                ifelse(Sever_incapacidad == 3, severidad_incapacidad <-1/2, 
+                       ifelse(Sever_incapacidad == 4, severidad_incapacidad <-1,
+                              ifelse(Sever_incapacidad == 5, severidad_incapacidad <-2, severidad_incapacidad <-3)))))
+  
+  # Tipo de severidad para la muerte
+  
+  severidad_muerte <- which(rmultinom(n=1, size = 1, prob = c(0.85, 0.1, 0.05))==1)
+
+  
+  # Cálculo del rezago
+  
+  rezago <- which(rmultinom(n=1, size = 1, prob = c(0.15, 0.25, 0.2, 0.4))==1)
+  
+  p_0 <- prima_0(b = b, N_0 = N_0, edad = edad_a, muerte = muerte_a, incapacidad = invalidez, 
+                 muerte_en_competencia =  muerte_en_competencia_a, incapacidad_en_competencia = invalidez_en_competencia)
+
+  perdida <- L_1(P_0=p_0, N_0 = N_0, b = b, rezago = rezago, tiempo_muerte_asegurado = tiempo_muerte_asegurado, 
+                 tiempo_incapacidad = tiempo_incapacidad, severidad_incapacidad = severidad_incapacidad, 
+                 severidad_muerte = severidad_muerte)
+
+  return(perdida)
+}
+
+# Prueba
+# mean(replicate(100, perdidas_estocasticas_sin_conyuge(población_asegurada[24,])))
+
+```
+
+# Modelo general
+
+A continuación se procede a generalizar ambas funciones en un único proceso. La idea general es determinar si existe cobertura para el cónyuge o no, y con base en eso utilizar una u otra función para determinar la pérdida asociada a cada una de las personas que adquieren el seguro. 
+
+Posteriormente, se aplican 10000 iteraciones del modelo y se promedian los resultados obtenidos. Finalmente se gráfican las pérdidas promediadas en un histograma para una visualización mas efectiva.
+
+```{r}
+
+perdidas <- function(vector){
+  
+  ifelse(vector[5]==0,
+         perdida <- perdidas_estocasticas_sin_conyuge(vector),
+         perdida <- perdidas_estocasticas(vector))
+  
+}
+
+perdidas_generadas <- replicate(10000, unlist(población_asegurada %>% apply(1, perdidas)))
+
+# Este es el promedio de perdidas de las 10 000 simulaciones para cada una de las personas que adquirió el seguro
+
+perdidas_promediadas <- as.data.frame(perdidas_generadas %>% apply(1, mean)) %>%
+  rename(Promedios = 1) 
+mean(perdidas_promediadas[,1])
+
+# Este es el promedio de los 27 casos para cada una de las simulaciones
+
+perdidas_promediadas_por_simulacion <- as.data.frame(perdidas_generadas %>% apply(2, mean)) %>% rename(Promedios = 1)
+mean(perdidas_promediadas_por_simulacion[,1])
+
+# VaR
+valor_en_riesgo <- VaR(perdidas_generadas, alpha = 0.05, type = "sample", tail = "upper")
+
+# CVaR
+valor_en_riesgo_condicional <- CVaR(perdidas_generadas, alpha = 0.05, type = "sample", tail = "upper")[1]
+
+# Histograma
+
+ggplot(perdidas_promediadas_por_simulacion, aes(x=Promedios)) + 
+  geom_histogram(color="darkblue", fill="lightblue") + 
+  geom_vline(aes(xintercept=mean(Promedios)),
+            color="darkred", linetype="dashed", size=1) +
+    labs(y = 'Frecuencia', x = 'Promedios', 
+       title = 'Histograma de las pérdidas promediadas por simulación') +
+  theme(legend.position = "bottom",  
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black"),
+         axis.text = element_text(colour = "black"),
+        legend.text = element_text(size = 14),  
+        legend.title = element_text(size = 14))
+```
+
+# Balance actuarial del portafolio de Clientes
+
